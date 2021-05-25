@@ -1,36 +1,40 @@
-﻿using CsvFileUploadSaveDb.Helpers;
-using CsvFileUploadSaveDb.Models;
-
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Distributed;
-using Microsoft.Extensions.Logging;
-
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-
-namespace CsvFileUploadSaveDb.Controllers
+﻿namespace CsvFileUploadSaveDb.Controllers
 {
+    using CsvFileUploadSaveDb.Helpers;
+    using CsvFileUploadSaveDb.Models;
+    using ExcelDataReader;
+    using Microsoft.AspNetCore.Hosting;
+    using Microsoft.AspNetCore.Http;
+    using Microsoft.AspNetCore.Mvc;
+    using Microsoft.Data.SqlClient;
+    using Microsoft.Extensions.Configuration;
+    using Microsoft.Extensions.Logging;
+    using System;
+    using System.Data;
+    using System.Diagnostics;
+    using System.IO;
+    using System.Linq;
+
     public class HomeController : Controller
     {
         private const string PROFILE_KEY = "profile";
         private readonly ILogger<HomeController> _logger;
+        private readonly IConfiguration _configuration;
         private readonly IWebHostEnvironment _env;
         private readonly ICacheHelper _cache;
 
         public HomeController(
             ILogger<HomeController> logger,
+            IConfiguration configuration,
             IWebHostEnvironment env,
             ICacheHelper cache)
         {
             _logger = logger;
+            _configuration = configuration;
             _env = env;
             _cache = cache;
+
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
         }
 
         public IActionResult Index()
@@ -51,35 +55,132 @@ namespace CsvFileUploadSaveDb.Controllers
 
         public IActionResult Upload(IFormFile file)
         {
+            var templateColumns = TemplateColumns.GCP_P710_Resource;
+            var tableName = "GCP_P710_Resource";
+            var deleteSpName = "Delete_GCP_P710_Resource";
 
-            string fileName = $"{_env.WebRootPath}\\{file.FileName}";
-
-            using (FileStream fs = System.IO.File.Create(fileName))
+            if (InvalidFileExtension(file.FileName))
             {
-                file.CopyTo(fs);
-                fs.Flush();
+                ViewData["message"] = "Invalid File";
+                return View("FileProcessStatus");
             }
 
-            ViewData["message"] = $"{file.Length} bytes uploaded successfully!";
+            using Stream stream = file.OpenReadStream();
+            using IExcelDataReader reader = ExcelReaderFactory.CreateReader(stream);
 
-            UserProfile userProfile = _cache.GetValue<UserProfile>(PROFILE_KEY);
+            SheetValidationResult validationResult = ValidateSheet(reader, templateColumns);
 
-            if (userProfile == null)
+            if (validationResult != SheetValidationResult.Success)
             {
-                // fetch from DB or some service
-                userProfile = new UserProfile
-                {
-                    UserName = "User1",
-                    LastUpdated = DateTime.Now
-                };
-
-                // store in cache
-                _cache.SetValue<UserProfile>(PROFILE_KEY, userProfile);
+                // Set proper message
+                ViewData["message"] = "Invalid Excel Work Book";
+                return View("FileProcessStatus");
             }
 
-            ViewData["userProfile"] = userProfile;
+            using DataSet dataSet = GetDataSet(reader, templateColumns);
+
+            SaveDataToDatabase(dataSet.Tables[0], templateColumns, tableName, deleteSpName);
+
+            ViewData["message"] = $"{dataSet.Tables[0].Rows.Count} records saved successfully!";
 
             return View("FileProcessStatus");
+        }
+
+        private bool InvalidFileExtension(string fileName)
+        {
+            if (String.Equals(Path.GetExtension(fileName), ".xls", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (String.Equals(Path.GetExtension(fileName), ".xlsx", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private SheetValidationResult ValidateSheet(
+            IExcelDataReader reader,
+            (string SheetName, string ColumnName)[] templateColumns)
+        {
+            if (!String.Equals(reader.Name, "sheet1", StringComparison.OrdinalIgnoreCase))
+            {
+                return SheetValidationResult.InvalidSheetName;
+            }
+
+            if (reader.RowCount == 0 || reader.RowCount == 0)
+            {
+                return SheetValidationResult.NoRecords;
+            }
+
+            reader.Read();
+
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                var columnName = reader.GetString(i);
+                bool exist = templateColumns.Any(config => string.Equals(
+                    config.SheetName,
+                    columnName,
+                    StringComparison.OrdinalIgnoreCase));
+
+                if (!exist)
+                {
+                    return SheetValidationResult.InvalidColumns;
+                }
+            }
+
+            return SheetValidationResult.Success;
+        }
+
+        private DataSet GetDataSet(IExcelDataReader reader, (string SheetName, string ColumnName)[] templateColumns)
+        {
+            reader.Reset();
+            DataSet dt = reader.AsDataSet(new ExcelDataSetConfiguration
+            {
+                ConfigureDataTable = (tableReader) => new ExcelDataTableConfiguration
+                {
+                    UseHeaderRow = true
+                }
+            });
+
+            FormatDataSet(dt, templateColumns);
+
+            return dt;
+        }
+
+        private void FormatDataSet(DataSet dt, (string SheetName, string ColumnName)[] templateColumns)
+        {
+            DataTable dataTable = dt.Tables[0];
+
+            for (int i = 0; i < dataTable.Columns.Count; i++)
+            {
+                DataColumn dataColumn = dataTable.Columns[i];
+                string columnName = dataColumn.ColumnName;
+                var columnConfig = templateColumns.First(
+                    config => String.Equals(config.SheetName, columnName, StringComparison.OrdinalIgnoreCase));
+                dataColumn.ColumnName = columnConfig.ColumnName;
+            }
+        }
+
+        private void SaveDataToDatabase(
+            DataTable dataTable,
+            (string SheetName, string ColumnName)[] templateColumns,
+            string destinationTable,
+            string deleteSpName)
+        {
+            string conString = _configuration.GetConnectionString("localdb");
+            using var connection = new SqlConnection(conString);
+            connection.Open();
+            var deleteCommand = new SqlCommand(deleteSpName, connection);
+            deleteCommand.CommandType = CommandType.StoredProcedure;
+            deleteCommand.ExecuteNonQuery();
+
+            using var bulkCopy = new SqlBulkCopy(conString, SqlBulkCopyOptions.UseInternalTransaction);
+            bulkCopy.BulkCopyTimeout = 0;
+            bulkCopy.DestinationTableName = destinationTable;
+            bulkCopy.WriteToServer(dataTable);
         }
     }
 }
