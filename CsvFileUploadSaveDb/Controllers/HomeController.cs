@@ -55,9 +55,11 @@
 
         public IActionResult Upload(IFormFile file)
         {
-            var templateColumns = TemplateColumns.GCP_P710_Resource;
-            var tableName = "GCP_P710_Resource";
-            var deleteSpName = "Delete_GCP_P710_Resource";
+            var templateConfig = GetTemplateConfig(new TemplateParams
+            {
+                ActionName = ControllerContext.ActionDescriptor.ActionName,
+                LocaationId = 75 // to be taken from user
+            });
 
             if (InvalidFileExtension(file.FileName))
             {
@@ -68,7 +70,7 @@
             using Stream stream = file.OpenReadStream();
             using IExcelDataReader reader = ExcelReaderFactory.CreateReader(stream);
 
-            SheetValidationResult validationResult = ValidateSheet(reader, templateColumns);
+            SheetValidationResult validationResult = ValidateSheet(reader, templateConfig.Template);
 
             if (validationResult != SheetValidationResult.Success)
             {
@@ -77,9 +79,9 @@
                 return View("FileProcessStatus");
             }
 
-            using DataSet dataSet = GetDataSet(reader, templateColumns);
+            using DataSet dataSet = GetDataSet(reader, templateConfig.Template);
 
-            SaveDataToDatabase(dataSet.Tables[0], templateColumns, tableName, deleteSpName);
+            SaveDataToDatabase(dataSet.Tables[0], templateConfig.Template, templateConfig.SqlTableName, templateConfig.DeleteSpName);
 
             ViewData["message"] = $"{dataSet.Tables[0].Rows.Count} records saved successfully!";
 
@@ -181,6 +183,11 @@
             bulkCopy.BulkCopyTimeout = 0;
             bulkCopy.DestinationTableName = destinationTable;
             bulkCopy.WriteToServer(dataTable);
+        }
+
+        private UploadTemplate GetTemplateConfig(TemplateParams templateParams)
+        {
+            return TemplateConfig.Templates.First(s => s.Condition(templateParams));
         }
     }
 }
